@@ -421,8 +421,14 @@ services:
           - grafana
 
 volumes:
-  cvat_db:
   cvat_data:
+    name: cvat_cvat_data
+    driver_opts:
+      device: /mnt/smb_10T/CVAT_data/cvat_data
+      o: bind
+      type: none
+#  cvat_data:
+  cvat_db:
   cvat_keys:
   cvat_logs:
   cvat_inmem_db:
