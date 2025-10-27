@@ -76,3 +76,6 @@ cvat-ui/dist
 **/!.yarn/releases
 **/!.yarn/sdks
 **/!.yarn/versions
+
+#etc.
+.specstory
