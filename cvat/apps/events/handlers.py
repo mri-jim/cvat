@@ -2,18 +2,27 @@
 #
 # SPDX-License-Identifier: MIT
 
+import logging
 import traceback
+from contextlib import suppress
 from typing import Any
 
 import rq
 from crum import get_current_request, get_current_user
+from django.db import DatabaseError
+from django.db.models import Model
+from django.http import HttpRequest
 from rest_framework import status
 from rest_framework.exceptions import NotAuthenticated
-from rest_framework.views import exception_handler
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.serializers import BaseSerializer
+from rest_framework.views import exception_handler as drf_exception_handler
 
 from cvat.apps.access_tokens.models import AccessToken
 from cvat.apps.access_tokens.serializers import AccessTokenReadSerializer
 from cvat.apps.dataset_manager.tracks_counter import TracksCounter
+from cvat.apps.dataset_manager.util import LockNotAvailableError
 from cvat.apps.engine.models import (
     CloudStorage,
     Comment,
@@ -23,7 +32,6 @@ from cvat.apps.engine.models import (
     Project,
     ShapeType,
     Task,
-    User,
 )
 from cvat.apps.engine.rq import BaseRQMeta
 from cvat.apps.engine.serializers import (
@@ -36,6 +44,8 @@ from cvat.apps.engine.serializers import (
     ProjectReadSerializer,
     TaskReadSerializer,
 )
+from cvat.apps.events import utils
+from cvat.apps.iam.models import User
 from cvat.apps.organizations.models import Invitation, Membership, Organization
 from cvat.apps.organizations.serializers import (
     InvitationReadSerializer,
@@ -44,6 +54,8 @@ from cvat.apps.organizations.serializers import (
 )
 from cvat.apps.webhooks.models import Webhook
 from cvat.apps.webhooks.serializers import WebhookReadSerializer
+from cvat.utils import django_database as db_utils
+from cvat.utils.http import ResourceIsBusyApiException
 
 from .cache import get_cache
 from .const import WORKING_TIME_RESOLUTION, WORKING_TIME_SCOPE
@@ -100,6 +112,15 @@ def job_id(instance):
         return None
 
 
+def _get_value(obj, key):
+    if obj is not None:
+        if isinstance(obj, dict):
+            return obj.get(key, None)
+        return getattr(obj, key, None)
+
+    return None
+
+
 def get_user(instance=None) -> User | dict | None:
     def _get_user_from_rq_job(rq_job: rq.job.Job) -> dict | None:
         if user := BaseRQMeta.for_job(rq_job).user:
@@ -126,6 +147,9 @@ def get_user(instance=None) -> User | dict | None:
 
 
 def get_request(instance=None):
+    if isinstance(instance, (HttpRequest, Request)):
+        return instance
+
     def _get_request_from_rq_job(rq_job: rq.job.Job) -> dict | None:
         if request := BaseRQMeta.for_job(rq_job).request:
             return request.to_dict()
@@ -141,15 +165,6 @@ def get_request(instance=None):
         rq_job = rq.get_current_job()
         if rq_job:
             return _get_request_from_rq_job(rq_job)
-
-    return None
-
-
-def _get_value(obj, key):
-    if obj is not None:
-        if isinstance(obj, dict):
-            return obj.get(key, None)
-        return getattr(obj, key, None)
 
     return None
 
@@ -270,7 +285,7 @@ def _get_object_name(instance):
     return None
 
 
-SERIALIZERS = [
+SERIALIZERS: list[tuple[type[Model], type[BaseSerializer]]] = [
     (AccessToken, AccessTokenReadSerializer),
     (Organization, OrganizationReadSerializer),
     (Project, ProjectReadSerializer),
@@ -287,21 +302,20 @@ SERIALIZERS = [
 ]
 
 
-def get_serializer(instance):
+def get_serializer(instance: Model) -> BaseSerializer | None:
     context = {"request": get_current_request()}
 
-    serializer = None
     for model, serializer_class in SERIALIZERS:
         if isinstance(instance, model):
-            serializer = serializer_class(instance=instance, context=context)
+            return serializer_class(instance=instance, context=context)
 
-    return serializer
+    return None
 
 
 SERIALIZER_CLEAN_UP_FIELDS = [
     (ProjectReadSerializer, ["tasks", "labels"]),
     (TaskReadSerializer, ["jobs", "labels"]),
-    (JobReadSerializer, ["labels", "issues", "replicas_count", "consensus_replicas"]),
+    (JobReadSerializer, ["labels", "issues", "replicas_count"]),
     (IssueReadSerializer, ["comments"]),
 ]
 
@@ -641,7 +655,10 @@ def handle_function_call(
     )
 
 
-def handle_rq_exception(rq_job, exc_type, exc_value, tb):
+def handle_rq_exception(rq_job: rq.job.Job, exc_type: type[Exception], exc_value: Exception, tb):
+    if utils.should_skip_rq_exception_event_recording(rq_job=rq_job, exc_value=exc_value):
+        return False
+
     rq_job_meta = BaseRQMeta.for_job(rq_job)
     oid = rq_job_meta.org_id
     oslug = rq_job_meta.org_slug
@@ -676,47 +693,96 @@ def handle_rq_exception(rq_job, exc_type, exc_value, tb):
     return False
 
 
-def handle_viewset_exception(exc, context):
+def exception_handler(exc: Exception, context) -> Response | None:
+    if isinstance(exc, DatabaseError):
+        if db_utils.is_lock_timeout_error(exc):
+            exc = ResourceIsBusyApiException()
+    elif isinstance(exc, LockNotAvailableError):
+        exc = ResourceIsBusyApiException()
+
+    return drf_exception_handler(exc=exc, context=context)
+
+
+def handle_viewset_exception(exc: Exception, context):
     response = exception_handler(exc, context)
 
     IGNORED_EXCEPTION_CLASSES = (NotAuthenticated,)
     if isinstance(exc, IGNORED_EXCEPTION_CLASSES):
         return response
+
     # the standard DRF exception handler only handle APIException, Http404 and PermissionDenied
     # exceptions types, any other will cause a 500 error
     status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
     if response is not None:
         status_code = response.status_code
-    request = context["request"]
-    view = context["view"]
 
-    tb_strings = traceback.format_exception(type(exc), exc, exc.__traceback__)
-
-    payload = {
-        "basename": getattr(view, "basename", None),
-        "action": getattr(view, "action", None),
-        "request": {
-            "url": request.get_full_path(),
-            "query_params": request.query_params,
-            "content_type": request.content_type,
-            "method": request.method,
-        },
-        "message": tb_strings[-1].rstrip("\n"),
-        "stack": "".join(tb_strings),
-        "status_code": status_code,
-    }
-
-    record_server_event(
-        scope="send:exception",
-        request_info=request_info(),
-        count=1,
-        user_id=getattr(request.user, "id", None),
-        user_name=getattr(request.user, "username", None),
-        user_email=getattr(request.user, "email", None),
-        payload=payload,
+    record_request_exception(
+        exc,
+        request=context["request"],
+        view=context["view"],
+        status_code=status_code,
     )
-
     return response
+
+
+def record_request_exception(
+    exc: BaseException,
+    *,
+    request: HttpRequest | Request,
+    view=None,
+    status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
+) -> None:
+    django_request = request._request if isinstance(request, Request) else request
+    # DRF exception handler may have already recorded an event and set this flag.
+    if getattr(django_request, "_exception_event_recorded", False):
+        return
+
+    try:
+        org = None
+        with suppress(Exception):
+            org = request.iam_context["organization"]
+
+        user_info = {"user_id": None, "user_name": None, "user_email": None}
+        with suppress(Exception):
+            user = getattr(request, "user", None)
+            user_info = {
+                "user_id": getattr(user, "id", None),
+                "user_name": getattr(user, "username", None),
+                "user_email": getattr(user, "email", None),
+            }
+
+        tb_strings = traceback.format_exception(type(exc), exc, exc.__traceback__)
+
+        payload = {
+            "basename": getattr(view, "basename", None),
+            "action": getattr(view, "action", None),
+            "request": {
+                "url": request.get_full_path(),
+                # Django's GET contains URL query parameters for every HTTP method.
+                "query_params": django_request.GET,
+                "content_type": request.content_type,
+                "method": request.method,
+            },
+            "message": tb_strings[-1].rstrip("\n"),
+            "stack": "".join(tb_strings),
+            "status_code": status_code,
+        }
+
+        record_server_event(
+            scope="send:exception",
+            request_info=request_info(django_request),
+            count=1,
+            org_id=getattr(org, "id", None),
+            org_slug=getattr(org, "slug", None),
+            payload=payload,
+            **user_info,
+        )
+        django_request._exception_event_recorded = True
+    except Exception:
+        # Event serialization or logging may fail; do not raise another exception because of it.
+        logging.getLogger(__name__).warning(
+            "Could not record request exception event", exc_info=True
+        )
 
 
 def handle_client_events_push(request, data: dict):

@@ -4,10 +4,11 @@
 
 
 from http import HTTPStatus
+from typing import Any
 
 import pytest
 
-from shared.utils.config import make_api_client, put_method
+from shared.utils.config import get_method, make_api_client, put_method
 
 
 @pytest.mark.usefixtures("restore_db_per_class")
@@ -40,3 +41,52 @@ class TestGetSchema:
 
             assert response.status == HTTPStatus.OK
             assert data
+
+
+@pytest.mark.usefixtures("restore_db_per_class")
+class TestPageSize:
+    def test_default_page_size(self, admin_user: str):
+        response = get_method(admin_user, "quality/conflicts")
+        assert response.status_code == HTTPStatus.OK
+        assert len(response.json()["results"]) == 10
+
+    @pytest.mark.parametrize(
+        "page_size, expected_page_size",
+        [
+            (50, 50),
+            (100, 100),
+            (1000, 100),
+        ],
+    )
+    def test_page_size(self, admin_user: str, page_size: int, expected_page_size: int):
+        response = get_method(admin_user, "quality/conflicts", page_size=page_size)
+        assert response.status_code == HTTPStatus.OK
+        assert len(response.json()["results"]) == expected_page_size
+
+    @pytest.mark.parametrize("page_size", [0, -1, "abc", "all", "1.5", ""])
+    def test_invalid_page_size_is_rejected(self, admin_user: str, page_size: Any):
+        response = get_method(admin_user, "quality/conflicts", page_size=page_size)
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert "page_size" in response.json()
+
+
+@pytest.mark.usefixtures("restore_db_per_class")
+class TestServerShare:
+    @pytest.mark.parametrize("search", ["image", "test_"])
+    def test_can_filter_share_by_name_prefix(self, admin_user: str, search: str):
+        with make_api_client(admin_user) as api_client:
+            all_entries, _ = api_client.server_api.list_share()
+            found_entries, response = api_client.server_api.list_share(search=search)
+
+        assert response.status == HTTPStatus.OK
+
+        expected = [e.to_dict() for e in all_entries if e.name.startswith(search)]
+        assert expected, f"test data has no share entries starting with {search!r}"
+        assert [e.to_dict() for e in found_entries] == expected
+
+    def test_share_search_without_matches_returns_empty_list(self, admin_user: str):
+        with make_api_client(admin_user) as api_client:
+            found_entries, response = api_client.server_api.list_share(search="no_such_prefix_")
+
+        assert response.status == HTTPStatus.OK
+        assert found_entries == []

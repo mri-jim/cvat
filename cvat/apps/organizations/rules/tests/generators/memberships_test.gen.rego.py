@@ -55,11 +55,13 @@ def RESOURCES(scope):
                 "user": {"id": random.randrange(300, 400)},
                 "is_active": active,
                 "role": role,
+                "new_role": new_role,
                 "organization": {"id": random.randrange(500, 600)},
             }
             for role in ORG_ROLES
             if role is not None
             for active in [False, True]
+            for new_role in (filter(None, ORG_ROLES) if scope == "change:role" else [None])
         ]
 
 
@@ -92,12 +94,13 @@ def eval_rule(scope, context, ownership, privilege, membership, data):
         filter(lambda r: not r["limit"] or eval(r["limit"], {"resource": resource}), rules)
     )
     if (
-        not is_same_org(data["auth"]["organization"], data["resource"]["organization"])
+        resource
+        and not is_same_org(data["auth"]["organization"], resource["organization"])
         and context != "sandbox"
     ):
         return False
 
-    if scope != "create" and not data["resource"]["is_active"]:
+    if scope != "create" and resource and not resource["is_active"]:
         is_staff = membership == "owner" or membership == "maintainer"
         if is_staff:
             if scope != "view":
@@ -107,8 +110,8 @@ def eval_rule(scope, context, ownership, privilege, membership, data):
                     return False
                 if resource["user"]["id"] == data["auth"]["user"]["id"]:
                     return False
-            return True
-        return False
+        else:
+            return False
 
     return bool(rules)
 
@@ -166,9 +169,9 @@ def get_name(scope, context, ownership, privilege, membership, resource, same_or
 def is_valid(scope, context, ownership, privilege, membership, resource, same_org):
     if context == "sandbox" and membership:
         return False
-    if scope == "list" and ownership != "None":
+    if scope == "list" and (same_org or ownership != "none"):
         return False
-    if context == "sandbox" and same_org is False:
+    if context == "sandbox" and same_org:
         return False
 
     return True
